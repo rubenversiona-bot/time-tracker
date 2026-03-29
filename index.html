@@ -199,8 +199,8 @@
 // ============================================================
 // CONFIG — Sustituir con tus datos antes de desplegar
 // ============================================================
-const API_URL = 'https://script.google.com/macros/s/AKfycbxKOeByCIzbzrVGAT-vNd2KAsZvDSusIsnK29bnkgZRFkBgFzht5wQtgaVn6cNdcS4R/exec';
-const API_TOKEN = 'A63353ffb3d6a41b69ff4c642b2bd8147d57b797606889aa9e0fb7354ba4fb5a';  // Mismo token que en Apps Script
+const API_URL = 'TU_URL_DE_APPS_SCRIPT_AQUI';
+const API_TOKEN = 'VA-2025-TU_TOKEN_SECRETO_AQUI';  // Mismo token que en Apps Script
 
 // ============================================================
 // STATE
@@ -214,6 +214,7 @@ let registros = [];
 let tramoNum = 0;
 let modalMode = '';
 let isConnected = false;
+let sesionInicio = null;  // Timestamp absoluto del inicio de sesión completa
 
 // ============================================================
 // HELPERS
@@ -226,7 +227,8 @@ function fechaHoraISO(d) {
   return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
 }
 function generarId() { return Math.random().toString(16).substr(2, 8) }
-function segundosAHoras(s) { return (s / 3600).toFixed(2) }
+function segundosAHoras(s) { return (s / 3600).toFixed(2).replace('.', ',') }
+function formatPrecio(p) { return p !== null && p !== '' ? String(p).replace('.', ',') : '' }
 
 function showToast(msg, duration = 3000) {
   const t = document.getElementById('toast');
@@ -241,6 +243,88 @@ function setConnStatus(status) {
   if (status === 'online') { el.textContent = '● conectado'; isConnected = true; }
   else if (status === 'offline') { el.textContent = '● sin conexión'; isConnected = false; }
   else { el.textContent = 'conectando...'; }
+}
+
+// ============================================================
+// SESSION PERSISTENCE (localStorage)
+// ============================================================
+function saveSession() {
+  const session = {
+    estado: estado,
+    tramoInicio: tramoInicio ? tramoInicio.getTime() : null,
+    tramoNum: tramoNum,
+    clienteId: document.getElementById('clienteSelect').value,
+    productoId: document.getElementById('productoSelect').value,
+    tramos: tramos,
+    sesionInicio: sesionInicio,
+    observaciones: document.getElementById('observaciones').value
+  };
+  localStorage.setItem('va_tt_session', JSON.stringify(session));
+}
+
+function clearSession() {
+  localStorage.removeItem('va_tt_session');
+}
+
+function getSavedSession() {
+  try {
+    const raw = localStorage.getItem('va_tt_session');
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
+}
+
+function restoreSession(session) {
+  // Restore selects
+  document.getElementById('clienteSelect').value = session.clienteId;
+  document.getElementById('productoSelect').value = session.productoId;
+  
+  // Restore tramos already saved
+  tramos = session.tramos || [];
+  tramoNum = session.tramoNum || 1;
+  sesionInicio = session.sesionInicio;
+  
+  if (session.observaciones) {
+    document.getElementById('observaciones').value = session.observaciones;
+  }
+
+  if (session.estado === 'running' && session.tramoInicio) {
+    // Timer was running — recalculate elapsed time from real timestamp
+    tramoInicio = new Date(session.tramoInicio);
+    const ahora = new Date();
+    const segsTramoActual = Math.round((ahora - tramoInicio) / 1000);
+    
+    // Total seconds = previous tramos + current running tramo
+    const segsPrevios = tramos.reduce((sum, t) => sum + t.segundos, 0);
+    segundos = segsPrevios + segsTramoActual;
+    
+    document.getElementById('timerDisplay').textContent = formatTime(segundos);
+    
+    // Restart the interval
+    intervalo = setInterval(() => {
+      const now = new Date();
+      const segsActual = Math.round((now - tramoInicio) / 1000);
+      const totalPrevios = tramos.reduce((s, t) => s + t.segundos, 0);
+      segundos = totalPrevios + segsActual;
+      document.getElementById('timerDisplay').textContent = formatTime(segundos);
+    }, 1000);
+    
+    setEstado('running');
+    renderControls();
+    updateTramoInfo();
+    showToast('✓ Sesión recuperada — timer en curso');
+
+  } else if (session.estado === 'paused') {
+    // Timer was paused — restore accumulated time
+    const segsPrevios = tramos.reduce((sum, t) => sum + t.segundos, 0);
+    segundos = segsPrevios;
+    document.getElementById('timerDisplay').textContent = formatTime(segundos);
+    
+    setEstado('paused');
+    renderControls();
+    updateTramoInfo();
+    showToast('✓ Sesión recuperada — timer en pausa');
+  }
 }
 
 // ============================================================
@@ -279,6 +363,25 @@ async function loadData() {
     }
     setConnStatus('online');
     showToast('✓ Datos cargados desde Google Sheets');
+    
+    // Check for saved session AFTER data is loaded
+    const saved = getSavedSession();
+    if (saved && (saved.estado === 'running' || saved.estado === 'paused' || (saved.tramos && saved.tramos.length > 0))) {
+      // Restore selects first
+      document.getElementById('clienteSelect').value = saved.clienteId;
+      document.getElementById('productoSelect').value = saved.productoId;
+      
+      const clienteNombre = (CLIENTES.find(c => c.id === saved.clienteId) || {}).nombre || saved.clienteId;
+      const tiempoInfo = saved.estado === 'running' && saved.tramoInicio
+        ? formatTime(Math.round((Date.now() - saved.tramoInicio) / 1000 + (saved.tramos || []).reduce((s,t) => s + t.segundos, 0)))
+        : formatTime((saved.tramos || []).reduce((s,t) => s + t.segundos, 0));
+      
+      if (confirm(`Se encontró una sesión activa:\n\nCliente: ${clienteNombre}\nEstado: ${saved.estado === 'running' ? 'En curso' : 'En pausa'}\nTiempo acumulado: ${tiempoInfo}\n\n¿Quieres recuperarla?`)) {
+        restoreSession(saved);
+      } else {
+        clearSession();
+      }
+    }
   } catch (err) {
     console.error('Error loading data:', err);
     setConnStatus('offline');
@@ -350,7 +453,7 @@ function renderProductoSelect() {
   const sel = document.getElementById('productoSelect');
   sel.innerHTML = '<option value="">— Selecciona producto —</option>';
   PRODUCTOS.forEach(p => {
-    const tag = p.precio ? ` (${p.precio}€/${p.unidad})` : '';
+    const tag = p.precio ? ` (${formatPrecio(p.precio)}€/${p.unidad})` : '';
     sel.innerHTML += `<option value="${p.id}">${p.desc}${tag}</option>`;
   });
 }
@@ -395,8 +498,14 @@ function startTimer() {
   if (!document.getElementById('clienteSelect').value) { alert('Selecciona un cliente'); return }
   if (!document.getElementById('productoSelect').value) { alert('Selecciona un producto'); return }
   tramoNum = 1; segundos = 0; tramoInicio = new Date();
-  intervalo = setInterval(() => { segundos++; document.getElementById('timerDisplay').textContent = formatTime(segundos) }, 1000);
+  sesionInicio = tramoInicio.getTime();
+  intervalo = setInterval(() => {
+    const now = new Date();
+    segundos = Math.round((now - tramoInicio) / 1000);
+    document.getElementById('timerDisplay').textContent = formatTime(segundos);
+  }, 1000);
   setEstado('running'); renderControls(); updateTramoInfo();
+  saveSession();
 }
 
 function pauseTimer() {
@@ -417,12 +526,20 @@ function pauseTimer() {
     _clienteNombre: (CLIENTES.find(c => c.id === document.getElementById('clienteSelect').value) || {}).nombre || ''
   });
   setEstado('paused'); renderControls(); updateTramoInfo();
+  saveSession();
 }
 
 function resumeTimer() {
   tramoNum++; tramoInicio = new Date();
-  intervalo = setInterval(() => { segundos++; document.getElementById('timerDisplay').textContent = formatTime(segundos) }, 1000);
+  intervalo = setInterval(() => {
+    const now = new Date();
+    const segsTramoActual = Math.round((now - tramoInicio) / 1000);
+    const segsPrevios = tramos.reduce((s, t) => s + t.segundos, 0);
+    segundos = segsPrevios + segsTramoActual;
+    document.getElementById('timerDisplay').textContent = formatTime(segundos);
+  }, 1000);
   setEstado('running'); renderControls(); updateTramoInfo();
+  saveSession();
 }
 
 function stopTimer() {
@@ -455,6 +572,7 @@ function stopTimer() {
     document.getElementById('pendienteBanner').classList.add('visible');
     document.getElementById('observaciones').focus();
     setTimeout(() => document.getElementById('observaciones').classList.remove('error'), 400);
+    saveSession(); // Keep tramos in storage until saved
   } else {
     guardarPendientes();
   }
@@ -486,6 +604,7 @@ async function guardarPendientes() {
   document.getElementById('pendienteBanner').classList.remove('visible');
   renderRegistros();
   updateTramoInfo();
+  clearSession(); // Session complete, clear storage
 
   // Sync to Sheets
   await syncRegistros(newRegs);
@@ -518,7 +637,7 @@ function renderRegistros() {
       </div>
       <div>
         <div class="reg-tiempo">${formatTime(r.segundos)}</div>
-        <div class="reg-horas">${r.unidades}h${r.precio ? ' · ' + r.precio + '€/ud' : ''}</div>
+        <div class="reg-horas">${r.unidades}h${r.precio ? ' · ' + formatPrecio(r.precio) + '€/ud' : ''}</div>
       </div>
     </div>`).join('');
 
@@ -575,6 +694,25 @@ async function confirmModal() {
 
 document.getElementById('modalOverlay').addEventListener('click', function(e) { if (e.target === this) closeModal() });
 document.getElementById('modalInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') confirmModal() });
+
+// ============================================================
+// BEFOREUNLOAD — Aviso al cerrar con timer activo
+// ============================================================
+window.addEventListener('beforeunload', function(e) {
+  if (estado === 'running' || estado === 'paused' || tramos.length > 0) {
+    saveSession();
+    e.preventDefault();
+    e.returnValue = '¿Seguro que quieres salir? Tienes un timer activo.';
+    return e.returnValue;
+  }
+});
+
+// Save session periodically while running (every 30s)
+setInterval(() => {
+  if (estado === 'running' || estado === 'paused' || tramos.length > 0) {
+    saveSession();
+  }
+}, 30000);
 
 // ============================================================
 // INIT
